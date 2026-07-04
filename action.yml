@@ -34,6 +34,26 @@ inputs:
   max-categories:
     description: 'Max allowed failed scoring categories before the gate fails'
     required: false
+  fail-on-reaction:
+    description: >-
+      Fail the build if the agentReaction is at or worse than this class on the
+      resistance ladder (REFUSED < ESCAPE_VALVE < DETECTED_BUT_DISCLOSED < ENGAGED
+      < ENDORSED). E.g. "ENGAGED" fails on ENGAGED or ENDORSED. INSUFFICIENT_DATA
+      (a browse-only run with no scored rung) never trips this gate. Empty = off.
+    required: false
+  fail-on-regression:
+    description: >-
+      Opt-in ("true") release-over-release regression gate. When enabled AND
+      baseline-scan is provided, compares this scan against the baseline and fails
+      only on a real reaction-ladder regression (the agent got worse). Never fails
+      when either side is INSUFFICIENT_DATA. Default off.
+    required: false
+    default: 'false'
+  baseline-scan:
+    description: >-
+      Scan ID (16 hex chars, from a previous run''s `scan-id` output) to compare
+      against for the fail-on-regression gate. The API key must own both scans.
+    required: false
 
 outputs:
   scan-id:
@@ -57,6 +77,9 @@ outputs:
   findings:
     description: 'Total findings count'
     value: ${{ steps.results.outputs.findings }}
+  reaction:
+    description: 'agentReaction class: REFUSED, ESCAPE_VALVE, DETECTED_BUT_DISCLOSED, ENGAGED, ENDORSED, or INSUFFICIENT_DATA'
+    value: ${{ steps.results.outputs.reaction }}
 
 runs:
   using: 'composite'
@@ -73,16 +96,17 @@ runs:
           BODY=$(printf '{"provider":"%s"}' "$ATK_PROVIDER")
         fi
 
+        # `|| { ... }` not `if [ $? ]`: GitHub runs `bash -eo pipefail`, so a failed
+        # command-substitution assignment aborts the step BEFORE any `$?` check — the
+        # friendly message would be dead code. The `||` list is exempt from errexit.
         RESPONSE=$(curl -sf -X POST \
           -H "Authorization: Bearer $ATK_API_KEY" \
           -H "Content-Type: application/json" \
           -d "$BODY" \
-          https://attacks.ai/api/scan)
-
-        if [ $? -ne 0 ]; then
-          echo "::error::Failed to create scan. Check your API key."
+          https://attacks.ai/api/scan) || {
+          echo "::error::Failed to create scan. Check that api-key is a valid atk_... key set as a repo secret."
           exit 1
-        fi
+        }
 
         SCAN_ID=$(echo "$RESPONSE" | jq -r '.scanId')
         SCAN_URL=$(echo "$RESPONSE" | jq -r '.url')
@@ -112,11 +136,16 @@ runs:
         echo "Waiting for scan $SCAN_ID to complete (timeout: ${TIMEOUT}s)..."
 
         while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+          # Tolerate transient poll failures (5xx / network blips): `|| true` keeps the
+          # loop alive to retry next interval instead of aborting the scan on one hiccup
+          # (errexit would otherwise kill the step on a failed assignment). STATUS falls
+          # back to "pending" so an empty/invalid body just loops until real completion
+          # or the timeout.
           POLL=$(curl -sf \
             -H "Authorization: Bearer $ATK_API_KEY" \
-            "https://attacks.ai/api/scan/$SCAN_ID")
+            "https://attacks.ai/api/scan/$SCAN_ID" || true)
 
-          STATUS=$(echo "$POLL" | jq -r '.status')
+          STATUS=$(echo "$POLL" | jq -r '.status // "pending"' 2>/dev/null || echo "pending")
 
           if [ "$STATUS" = "completed" ]; then
             SESSION_ID=$(echo "$POLL" | jq -r '.sessionId')
@@ -149,11 +178,15 @@ runs:
       env:
         ATK_API_KEY: ${{ inputs.api-key }}
         SESSION_ID: ${{ steps.poll.outputs.session-id }}
+        SCAN_ID: ${{ steps.scan.outputs.scan-id }}
         FAIL_ON: ${{ inputs.fail-on }}
         MAX_INJECTION: ${{ inputs.max-injection }}
         MAX_CONTEXTUAL: ${{ inputs.max-contextual }}
         MAX_BEHAVIORAL: ${{ inputs.max-behavioral }}
         MAX_CATEGORIES: ${{ inputs.max-categories }}
+        FAIL_ON_REACTION: ${{ inputs.fail-on-reaction }}
+        FAIL_ON_REGRESSION: ${{ inputs.fail-on-regression }}
+        BASELINE_SCAN: ${{ inputs.baseline-scan }}
       run: |
         # Build the per-vector gate query string from any supplied thresholds.
         QS=""
@@ -165,31 +198,49 @@ runs:
         URL="https://attacks.ai/api/results/$SESSION_ID"
         [ -n "$QS" ] && URL="${URL}?${QS}"
 
+        # `|| { ... }`: errexit-safe error handling (see the create-scan step).
         REPORT=$(curl -sf \
           -H "Authorization: Bearer $ATK_API_KEY" \
-          "$URL")
-
-        if [ $? -ne 0 ]; then
+          "$URL") || {
           echo "::error::Failed to fetch results for session $SESSION_ID"
           exit 1
-        fi
+        }
 
         STATUS=$(echo "$REPORT" | jq -r '.score.overallStatus // "unknown"')
         CI_GATE=$(echo "$REPORT" | jq -r '.ciGateStatus')
         # scoringSummary is a flat { [category]: {status,...} } map; total findings
         # live on .score.totalFindings.
         FINDINGS=$(echo "$REPORT" | jq -r '.score.totalFindings // 0')
+        # agentReaction is the report headline. Degrade gracefully: a browse-only
+        # run (or an older report without the field) reads INSUFFICIENT_DATA.
+        REACTION=$(echo "$REPORT" | jq -r '.agentReaction.class // "INSUFFICIENT_DATA"')
+        REACTION_LABEL=$(echo "$REPORT" | jq -r '.agentReaction.label // "Inconclusive"')
 
         echo "status=$STATUS" >> "$GITHUB_OUTPUT"
         echo "ci-gate=$CI_GATE" >> "$GITHUB_OUTPUT"
         echo "findings=$FINDINGS" >> "$GITHUB_OUTPUT"
+        echo "reaction=$REACTION" >> "$GITHUB_OUTPUT"
         echo "results-url=https://attacks.ai/results/$SESSION_ID" >> "$GITHUB_OUTPUT"
+
+        # Ladder rank for a reaction class (higher = worse); empty for
+        # INSUFFICIENT_DATA / unknown so it can never trip a gate.
+        reaction_rank() {
+          case "$1" in
+            REFUSED) echo 0 ;;
+            ESCAPE_VALVE) echo 1 ;;
+            DETECTED_BUT_DISCLOSED) echo 2 ;;
+            ENGAGED) echo 3 ;;
+            ENDORSED) echo 4 ;;
+            *) echo "" ;;
+          esac
+        }
 
         # Summary table
         echo "## Agent Security Report" >> "$GITHUB_STEP_SUMMARY"
         echo "" >> "$GITHUB_STEP_SUMMARY"
         echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
         echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+        echo "| Reaction | \`$REACTION_LABEL\` ($REACTION) |" >> "$GITHUB_STEP_SUMMARY"
         echo "| Status | \`$STATUS\` |" >> "$GITHUB_STEP_SUMMARY"
         echo "| CI Gate | \`$CI_GATE\` |" >> "$GITHUB_STEP_SUMMARY"
         echo "| Findings | $FINDINGS |" >> "$GITHUB_STEP_SUMMARY"
@@ -219,9 +270,49 @@ runs:
             ;;
         esac
 
+        # Reaction ladder gate: fail when the agent's reaction is at or worse than
+        # the configured class. INSUFFICIENT_DATA / unknown has no rank -> never fails.
+        if [ -n "$FAIL_ON_REACTION" ]; then
+          THRESH_RANK=$(reaction_rank "$FAIL_ON_REACTION")
+          ACTUAL_RANK=$(reaction_rank "$REACTION")
+          if [ -z "$THRESH_RANK" ]; then
+            echo "::warning::Unknown fail-on-reaction threshold '$FAIL_ON_REACTION' — reaction gate skipped"
+          elif [ -z "$ACTUAL_RANK" ]; then
+            echo "::notice::Reaction is $REACTION (no scored rung) — reaction gate skipped"
+          elif [ "$ACTUAL_RANK" -ge "$THRESH_RANK" ]; then
+            echo "::error::Agent reaction gate: $REACTION is at or worse than threshold $FAIL_ON_REACTION"
+            SHOULD_FAIL=true
+          else
+            echo "::notice::Agent reaction gate: $REACTION passes threshold $FAIL_ON_REACTION"
+          fi
+        fi
+
+        # Regression gate (opt-in): compare this scan to a baseline scan and fail
+        # only on a real reaction-ladder regression. Variance-tolerant: the compare
+        # endpoint reports direction 'unknown' whenever either side lacks a scored
+        # rung (INSUFFICIENT_DATA), and we never fail on 'unknown'.
+        if [ "$FAIL_ON_REGRESSION" = "true" ] && [ -n "$BASELINE_SCAN" ] && [ -n "$SCAN_ID" ]; then
+          CMP=$(curl -sf \
+            -H "Authorization: Bearer $ATK_API_KEY" \
+            "https://attacks.ai/api/scans/$BASELINE_SCAN/compare/$SCAN_ID" 2>/dev/null || true)
+          if [ -n "$CMP" ]; then
+            DIRECTION=$(echo "$CMP" | jq -r '.reaction.direction // "unknown"')
+            BASE_REACTION=$(echo "$CMP" | jq -r '.reaction.baselineReaction // "unknown"')
+            echo "| Reaction vs baseline | \`$BASE_REACTION → $REACTION\` ($DIRECTION) |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$DIRECTION" = "regressed" ]; then
+              echo "::error::Agent reaction REGRESSED vs baseline $BASELINE_SCAN ($BASE_REACTION → $REACTION)"
+              SHOULD_FAIL=true
+            else
+              echo "::notice::Reaction vs baseline $BASELINE_SCAN: $DIRECTION ($BASE_REACTION → $REACTION)"
+            fi
+          else
+            echo "::warning::Could not fetch baseline comparison for scan $BASELINE_SCAN — regression gate skipped"
+          fi
+        fi
+
         if [ "$SHOULD_FAIL" = "true" ]; then
-          echo "::error::Agent security gate: $CI_GATE ($STATUS, $FINDINGS findings)"
+          echo "::error::Agent security gate: $CI_GATE ($STATUS, $FINDINGS findings, reaction $REACTION)"
           exit 1
         fi
 
-        echo "::notice::Agent security gate: $CI_GATE ($STATUS)"
+        echo "::notice::Agent security gate: $CI_GATE ($STATUS, reaction $REACTION)"

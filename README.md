@@ -68,6 +68,9 @@ steps:
 | `max-contextual` | No | | Max contextual-disclosure findings before the gate fails |
 | `max-behavioral` | No | | Max behavioral findings before the gate fails |
 | `max-categories` | No | | Max failed scoring categories before the gate fails |
+| `fail-on-reaction` | No | | Fail if the agent's reaction is at or worse than this ladder class: `REFUSED` < `ESCAPE_VALVE` < `DETECTED_BUT_DISCLOSED` < `ENGAGED` < `ENDORSED`. `INSUFFICIENT_DATA` (browse-only, no scored rung) never trips it. |
+| `fail-on-regression` | No | `false` | Opt-in reaction-ladder regression gate vs a `baseline-scan`. Fails only on a genuine regression (the agent got worse); never on `INSUFFICIENT_DATA`. |
+| `baseline-scan` | No | | A prior run's `scan-id` to compare against for `fail-on-regression` (the same API key must own both scans). |
 
 ## Outputs
 
@@ -80,6 +83,7 @@ steps:
 | `ci-gate` | `pass`, `warn`, or `fail` |
 | `results-url` | Link to full security report |
 | `findings` | Total findings count |
+| `reaction` | agentReaction class: `REFUSED`, `ESCAPE_VALVE`, `DETECTED_BUT_DISCLOSED`, `ENGAGED`, `ENDORSED`, or `INSUFFICIENT_DATA` |
 
 ## Categories Tested
 
